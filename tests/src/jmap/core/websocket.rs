@@ -6,7 +6,7 @@
 
 use crate::jmap::JMAPTest;
 use ahash::AHashSet;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use jmap_client::{
     DataType, PushObject,
     client_ws::WebSocketMessage,
@@ -17,6 +17,7 @@ use jmap_client::{
 };
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 pub async fn test(params: &mut JMAPTest) {
     println!("Running WebSockets tests...");
@@ -146,4 +147,130 @@ async fn expect_nothing(stream_rx: &mut mpsc::Receiver<WebSocketMessage>) {
             panic!("Received a message when expecting nothing: {:?}", message);
         }
     }
+}
+
+// WebSocket Ticket Authentication Tests
+pub async fn test_ticket_auth(params: &mut JMAPTest) {
+    println!("Running WebSocket Ticket Authentication tests...");
+
+    let account = params.account("jdoe@example.com");
+    let client = account.client();
+
+    // Get an access token for the account
+    let access_token = client.access_token();
+
+    // Step 1: Request a WebSocket ticket
+    println!("  - Testing ticket generation...");
+    let ticket_response = reqwest::Client::builder()
+        .timeout(Duration::from_millis(5000))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .post("https://127.0.0.1:8899/jmap/ws/ticket")
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ticket_response.status().as_u16(),
+        200,
+        "Ticket request should succeed"
+    );
+
+    let ticket_json: serde_json::Value = ticket_response.json().await.unwrap();
+    let ticket = ticket_json["value"].as_str().unwrap();
+    assert!(!ticket.is_empty(), "Ticket should not be empty");
+    println!("    Ticket generated successfully");
+
+    // Step 2: Connect to WebSocket using the ticket
+    println!("  - Testing WebSocket connection with ticket...");
+    let ws_url = format!("wss://127.0.0.1:8899/jmap/ws?ticket={}", ticket);
+
+    // Create a TLS connector that accepts invalid certs for testing
+    let connector = native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let connector = tokio_tungstenite::Connector::NativeTls(connector);
+
+    let (mut ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(
+        &ws_url,
+        None,
+        false,
+        Some(connector),
+    )
+    .await
+    .expect("WebSocket connection with valid ticket should succeed");
+
+    println!("    WebSocket connected successfully with ticket");
+
+    // Step 3: Send a JMAP request over WebSocket to verify it works
+    println!("  - Testing JMAP request over ticket-authenticated WebSocket...");
+    let jmap_request = serde_json::json!({
+        "@type": "Request",
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+        "methodCalls": [
+            ["Mailbox/get", {"accountId": account.id_string(), "ids": null}, "0"]
+        ]
+    });
+
+    ws_stream
+        .send(Message::Text(jmap_request.to_string().into()))
+        .await
+        .expect("Should be able to send JMAP request");
+
+    // Wait for response
+    let response = tokio::time::timeout(Duration::from_secs(5), ws_stream.next())
+        .await
+        .expect("Should receive response within timeout")
+        .expect("Stream should not be closed")
+        .expect("Message should be valid");
+
+    match response {
+        Message::Text(text) => {
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert!(
+                json.get("methodResponses").is_some(),
+                "Response should contain methodResponses"
+            );
+            println!("    JMAP request/response successful");
+        }
+        _ => panic!("Expected text message, got: {:?}", response),
+    }
+
+    // Close the WebSocket
+    ws_stream.close(None).await.ok();
+
+    // Step 4: Test that invalid ticket is rejected
+    println!("  - Testing invalid ticket rejection...");
+    let invalid_ws_url = "wss://127.0.0.1:8899/jmap/ws?ticket=invalid_ticket_value";
+
+    let connector = native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let connector = tokio_tungstenite::Connector::NativeTls(connector);
+
+    let result = tokio_tungstenite::connect_async_tls_with_config(
+        invalid_ws_url,
+        None,
+        false,
+        Some(connector),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "WebSocket connection with invalid ticket should fail"
+    );
+    println!("    Invalid ticket correctly rejected");
+
+    // Step 5: Test that ticket cannot be reused (optional, depends on implementation)
+    // Tickets are single-use in some implementations
+
+    // Step 6: Test ticket expiration (would need to wait for expiry time)
+    // Skipped in automated tests to avoid long wait times
+
+    println!("WebSocket Ticket Authentication tests completed successfully!");
 }

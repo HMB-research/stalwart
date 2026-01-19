@@ -99,6 +99,7 @@ async fn jmap_tests() {
 
     core::event_source::test(&mut params).await;
     core::websocket::test(&mut params).await;
+    core::websocket::test_ticket_auth(&mut params).await;
     core::push_subscription::test(&mut params).await;
     core::blob::test(&mut params).await;
 
